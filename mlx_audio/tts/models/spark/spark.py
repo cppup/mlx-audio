@@ -13,7 +13,6 @@ from tqdm import tqdm
 
 from mlx_audio.tts.models.base import BaseModelArgs, GenerationResult
 
-from .audio_tokenizer import BiCodecTokenizer
 from .utils.token_parser import GENDER_MAP, LEVELS_MAP, TASK_TOKEN_MAP
 
 PITCH_MAP = SPEED_MAP = {
@@ -77,6 +76,7 @@ class Model(nn.Module):
         Used to initialize the tokenizer which is required for text input.
         """
         from transformers import AutoTokenizer
+        from .audio_tokenizer import BiCodecTokenizer
 
         print(
             f"Loading tokenizer from {model_path} with eos_token_ids={model.config.eos_token_id}"

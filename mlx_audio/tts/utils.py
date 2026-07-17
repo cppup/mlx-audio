@@ -17,6 +17,9 @@ from mlx_audio.utils import (
 )
 
 MODEL_REMAPPING = {
+    "dots": "dots_tts",
+    "dots_tts": "dots_tts",
+    "dots_tts_mlx": "dots_tts",
     "qwen3_tts": "qwen3_tts",
     "outetts": "outetts",
     "spark": "spark",
@@ -47,6 +50,39 @@ MODEL_REMAPPING = {
 }
 MAX_FILE_SIZE_GB = 5
 MODEL_CONVERSION_DTYPES = ["float16", "bfloat16", "float32"]
+DOTS_REPO_HINTS = ("dots-tts", "dots_tts", "dots")
+DOTS_REQUIRED_FILES = (
+    "config.json",
+    "llm_config.json",
+    "core.safetensors",
+    "vocoder.safetensors",
+    "speaker.safetensors",
+)
+
+
+def _looks_like_dots_checkpoint(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    names = {item.name for item in path.iterdir()}
+    return set(DOTS_REQUIRED_FILES).issubset(names)
+
+
+def _looks_like_dots_repo_root(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    for item in path.iterdir():
+        if item.is_dir() and _looks_like_dots_checkpoint(item):
+            return True
+    return False
+
+
+def _should_try_dots_fallback(model_path: Union[str, Path]) -> bool:
+    if isinstance(model_path, str):
+        normalized = model_path.lower()
+        return any(hint in normalized for hint in DOTS_REPO_HINTS)
+    if isinstance(model_path, Path):
+        return _looks_like_dots_repo_root(model_path.expanduser())
+    return False
 
 
 # Get a list of all available model types from the models directory
@@ -98,7 +134,7 @@ def get_model_and_args(model_type: str, model_name: List[str]) -> Tuple[Any, str
 
 
 def load_model(
-    model_path: Path,
+    model_path: Union[str, Path],
     lazy: bool = False,
     strict: bool = True,
     **kwargs: Any,
@@ -107,7 +143,7 @@ def load_model(
     Load and initialize the model from a given path.
 
     Args:
-        model_path (Path): The path to load the model from.
+        model_path (Union[str, Path]): The path or Hugging Face repo to load from.
         lazy (bool): If False eval the model parameters to make sure they are
             loaded in memory before returning, otherwise they will be loaded
             when needed. Default: ``False``
@@ -119,14 +155,28 @@ def load_model(
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
-    return base_load_model(
-        model_path=model_path,
-        category="tts",
-        model_remapping=MODEL_REMAPPING,
-        lazy=lazy,
-        strict=strict,
-        **kwargs,
-    )
+    try:
+        return base_load_model(
+            model_path=model_path,
+            category="tts",
+            model_remapping=MODEL_REMAPPING,
+            lazy=lazy,
+            strict=strict,
+            **kwargs,
+        )
+    except FileNotFoundError:
+        if not _should_try_dots_fallback(model_path):
+            raise
+        from .models import dots_tts
+
+        dots_kwargs = dict(kwargs)
+        dots_kwargs.pop("allow_patterns", None)
+        return dots_tts.load_model(
+            model_path=model_path,
+            lazy=lazy,
+            strict=strict,
+            **dots_kwargs,
+        )
 
 
 def load(
