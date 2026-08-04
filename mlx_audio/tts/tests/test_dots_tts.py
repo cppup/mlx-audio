@@ -120,10 +120,9 @@ class TestDotsDirectLoader(unittest.TestCase):
                         strict=False,
                     )
 
-    def test_common_tts_loader_falls_back_to_dots_loader_for_hf_repo_root(self):
+    def test_common_tts_loader_does_not_fallback_to_dots_loader_for_hf_repo_root(self):
         from mlx_audio.tts import utils as tts_utils
 
-        fallback_model = MagicMock()
         with (
             patch.object(
                 tts_utils,
@@ -131,22 +130,17 @@ class TestDotsDirectLoader(unittest.TestCase):
                 side_effect=FileNotFoundError("Config not found"),
             ),
             patch(
-                "mlx_audio.tts.models.dots_tts.load_model", return_value=fallback_model
+                "mlx_audio.tts.models.dots_tts.load_model"
             ) as dots_load_model,
         ):
-            model = tts_utils.load_model("mlx-community/dots-tts-mlx", lazy=True)
+            with self.assertRaisesRegex(FileNotFoundError, "Config not found"):
+                tts_utils.load_model("mlx-community/dots-tts-mlx", lazy=True)
 
-        self.assertIs(model, fallback_model)
-        dots_load_model.assert_called_once_with(
-            model_path="mlx-community/dots-tts-mlx",
-            lazy=True,
-            strict=True,
-        )
+        dots_load_model.assert_not_called()
 
-    def test_common_tts_loader_falls_back_for_local_dots_repo_root(self):
+    def test_common_tts_loader_does_not_fallback_for_local_dots_repo_root(self):
         from mlx_audio.tts import utils as tts_utils
 
-        fallback_model = MagicMock()
         with tempfile.TemporaryDirectory() as tmpdir:
             repo_root = Path(tmpdir)
             self._write_dots_checkpoint(repo_root / "int4")
@@ -158,17 +152,12 @@ class TestDotsDirectLoader(unittest.TestCase):
                 ),
                 patch(
                     "mlx_audio.tts.models.dots_tts.load_model",
-                    return_value=fallback_model,
                 ) as dots_load_model,
             ):
-                model = tts_utils.load_model(repo_root, lazy=True)
+                with self.assertRaisesRegex(FileNotFoundError, "Config not found"):
+                    tts_utils.load_model(repo_root, lazy=True)
 
-        self.assertIs(model, fallback_model)
-        dots_load_model.assert_called_once_with(
-            model_path=repo_root,
-            lazy=True,
-            strict=True,
-        )
+        dots_load_model.assert_not_called()
 
 
 class TestDotsModel(unittest.TestCase):
@@ -374,6 +363,17 @@ class TestDotsLoaderModuleBehavior(unittest.TestCase):
             loader._apply_memory_limit_from_env()
 
         set_memory_limit.assert_called_once_with(7 * (1 << 30))
+
+    def test_loader_memory_limit_is_not_applied_by_default(self):
+        from mlx_audio.tts.models.dots_tts import loader
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(loader.mx, "set_memory_limit") as set_memory_limit,
+        ):
+            loader._apply_memory_limit_from_env()
+
+        set_memory_limit.assert_not_called()
 
 
 if __name__ == "__main__":

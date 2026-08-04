@@ -1,7 +1,6 @@
 """MLX runtime loader for dots.tts.
 
-Sets a conservative MLX memory ceiling at import as a safety guard, then provides a
-``DotsTts`` container + ``from_pretrained`` that loads the config,
+Provides a ``DotsTts`` container + ``from_pretrained`` that loads the config,
 latent stats, tokenizer dir, and validates the three converted safetensors.
 
 Submodule wiring (instantiating the DiT / encoder / vocoder / speaker / LLM and
@@ -61,7 +60,9 @@ _SAFETENSORS = ("core.safetensors", "vocoder.safetensors", "speaker.safetensors"
 
 
 def _apply_memory_limit_from_env() -> None:
-    raw_limit = os.environ.get("MLX_AUDIO_DOTS_MEMORY_LIMIT_GB", "20")
+    raw_limit = os.environ.get("MLX_AUDIO_DOTS_MEMORY_LIMIT_GB")
+    if raw_limit is None:
+        return
     try:
         limit_gb = int(raw_limit)
     except ValueError as exc:
