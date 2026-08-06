@@ -188,6 +188,7 @@ class SinusoidalPositionEmbedding(nn.Module):
         self._positional_embedding = mx.concatenate(
             [mx.sin(scaled_time), mx.cos(scaled_time)], axis=1
         )
+        mx.eval(self._positional_embedding)
 
     def __call__(self, seqlen: int) -> mx.array:
         return self._positional_embedding[:seqlen, :]
@@ -1097,6 +1098,7 @@ class Qwen3ASRModel(nn.Module):
         *,
         max_tokens,
         sampler,
+        logits_processors,
         language,
         system_prompt,
         batch_size,
@@ -1130,6 +1132,7 @@ class Qwen3ASRModel(nn.Module):
             pad_to = max(len(c[0]) for c in group)
 
             embeds = []
+            token_histories = [] if logits_processors else None
             for chunk_audio, _ in group:
                 audio = chunk_audio
                 if len(audio) < pad_to:
@@ -1138,6 +1141,8 @@ class Qwen3ASRModel(nn.Module):
                 af = self.get_audio_features(feats, fmask)
                 input_ids = self._build_prompt(n_audio, language, system_prompt)
                 embeds.append(self._build_inputs_embeds(input_ids, af)[0])
+                if token_histories is not None:
+                    token_histories.append(input_ids[0, -1:])
 
             x = mx.stack(embeds, axis=0)  # (B, L, H), equal L
             bsz = x.shape[0]
@@ -1156,7 +1161,19 @@ class Qwen3ASRModel(nn.Module):
                 if self.lm_head is not None
                 else self.model.embed_tokens.as_linear(hidden)
             )
-            y = sampler(logits[:, -1, :])
+
+            def apply_logits_processors(logits):
+                if token_histories is None:
+                    return logits
+                processed = []
+                for i, tokens in enumerate(token_histories):
+                    sample_logits = logits[i : i + 1]
+                    for processor in logits_processors:
+                        sample_logits = processor(tokens, sample_logits)
+                    processed.append(sample_logits)
+                return mx.concatenate(processed, axis=0)
+
+            y = sampler(apply_logits_processors(logits[:, -1, :]))
             mx.async_eval(y)
 
             out_ids = [[] for _ in range(bsz)]
@@ -1164,16 +1181,24 @@ class Qwen3ASRModel(nn.Module):
             group_tokens = 0
             budget_exhausted = False
             for _ in range(remaining_tokens):
+                if token_histories is not None:
+                    for i in range(bsz):
+                        if not done[i]:
+                            token_histories[i] = mx.concatenate(
+                                [token_histories[i], y[i : i + 1]]
+                            )
+
                 # Build and kick off the next step before consuming the current
                 # one, so the GPU runs this step while Python walks the tokens
                 # (overlap pattern from mlx_lm.generate_step).
                 next_logits = self._forward_with_embeds(
                     self.model.embed_tokens(y[:, None]), cache
                 )
-                next_y = sampler(next_logits[:, -1, :])
+                next_y = sampler(apply_logits_processors(next_logits[:, -1, :]))
                 mx.async_eval(next_y)
 
-                for i, t in enumerate(y.tolist()):
+                current_tokens = y.tolist()
+                for i, t in enumerate(current_tokens):
                     if budget_exhausted:
                         break
                     if done[i]:
@@ -1315,6 +1340,7 @@ class Qwen3ASRModel(nn.Module):
                 chunks,
                 max_tokens=max_tokens,
                 sampler=sampler,
+                logits_processors=logits_processors,
                 language=language,
                 system_prompt=system_prompt,
                 batch_size=batch_size,

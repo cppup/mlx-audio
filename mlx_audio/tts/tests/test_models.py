@@ -1449,6 +1449,39 @@ class TestChatterboxConfig(unittest.TestCase):
         self.assertEqual(config.model_type, "chatterbox")
         self.assertTrue(config.t3_config.is_multilingual)
 
+    def test_v3_legacy_config_builds_multilingual_t3(self):
+        """V3's compact config must build the 2,454-token T3 architecture."""
+        from mlx_audio.tts.models.chatterbox.config import ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "chatterbox",
+                "multilingual": True,
+                "vocab_size": 2454,
+                "t3_model": "v3",
+            }
+        )
+
+        self.assertTrue(config.multilingual)
+        self.assertTrue(config.t3_config.is_multilingual)
+        self.assertEqual(config.t3_model, "v3")
+        self.assertEqual(config.text_preprocessing, "NFKD,fullcase")
+
+    def test_existing_multilingual_config_is_identified_as_v2(self):
+        from mlx_audio.tts.models.chatterbox.config import ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "model_type": "chatterbox",
+                "multilingual": True,
+                "vocab_size": 2454,
+            }
+        )
+
+        self.assertEqual(config.t3_model, "v2")
+        self.assertEqual(config.text_preprocessing, "legacy")
+        self.assertTrue(config.t3_config.is_multilingual)
+
 
 class TestChatterboxModel(unittest.TestCase):
     @patch("mlx_audio.tts.models.chatterbox.chatterbox.T3")
@@ -1503,6 +1536,43 @@ class TestChatterboxModel(unittest.TestCase):
         self.assertIn("ve.lstm.weight", result)
         self.assertIn("t3.tfmr.weight", result)
         self.assertIn("s3gen.flow.weight", result)
+
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.T3")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.S3Token2Wav")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.VoiceEncoder")
+    @patch("mlx_audio.tts.models.chatterbox.chatterbox.S3TokenizerV2")
+    def test_v3_english_uses_multilingual_tokenizer_and_preserves_case(
+        self, mock_s3_tokenizer, mock_ve, mock_s3gen, mock_t3
+    ):
+        from mlx_audio.tts.models.chatterbox.chatterbox import Model
+        from mlx_audio.tts.models.chatterbox.config import ModelConfig
+
+        model = Model(ModelConfig.from_dict({"t3_model": "v3"}))
+        model.mtl_tokenizer = MagicMock()
+        model.mtl_tokenizer.text_to_tokens.return_value = mx.array([[1, 2]])
+
+        tokens = model._tokenize_text("hello V3", "en")
+
+        self.assertEqual(tokens.shape, (1, 2))
+        model.mtl_tokenizer.text_to_tokens.assert_called_once_with(
+            "hello V3.", language_id="en"
+        )
+
+
+class TestChatterboxV3Tokenizer(unittest.TestCase):
+    def test_v3_preprocessing_uses_fullcase_nfkd(self):
+        from unicodedata import normalize
+
+        from mlx_audio.tts.models.chatterbox.tokenizer import MTLTokenizer
+
+        tokenizer = MTLTokenizer.__new__(MTLTokenizer)
+        tokenizer.text_preprocessing = "NFKD,fullcase"
+        tokenizer.cangjie_converter = lambda text: text
+
+        self.assertEqual(
+            tokenizer.preprocess_text("ÄBC", language_id="ja"),
+            normalize("NFKD", "ÄBC"),
+        )
 
 
 class TestChatterboxFromPretrainedQuantization(unittest.TestCase):
@@ -3023,6 +3093,37 @@ class TestQwen3TTSGenerateICL(unittest.TestCase):
             # token_count should be <= 2
             self.assertLessEqual(results[0].token_count, 2)
 
+    def test_generate_icl_streaming_clears_cache_once_at_end(self):
+        """Streaming avoids cache clears in the token and vocoder hot paths."""
+        model = self._make_icl_model()
+        ref_audio = mx.random.normal((24000,))
+
+        model.speech_tokenizer.decoder.streaming_step.side_effect = (
+            lambda codes: mx.ones((1, 1, codes.shape[-1] * 1920))
+        )
+
+        with (
+            patch.object(model, "_sample_token", return_value=mx.array([[5]])),
+            patch(
+                "mlx_audio.tts.models.qwen3_tts.qwen3_tts.mx.clear_cache"
+            ) as mock_clear_cache,
+        ):
+            results = list(
+                model._generate_icl(
+                    text="Hello",
+                    ref_audio=ref_audio,
+                    ref_text="Ref",
+                    max_tokens=51,
+                    repetition_penalty=1.5,
+                    stream=True,
+                    streaming_interval=0.1,
+                )
+            )
+
+        self.assertEqual(len(results), 51)
+        self.assertEqual(model.speech_tokenizer.decoder.streaming_step.call_count, 51)
+        mock_clear_cache.assert_called_once_with()
+
     def test_generate_icl_repetition_penalty_applied(self):
         """Test that repetition penalty is applied during generation."""
         model = self._make_icl_model()
@@ -3280,6 +3381,9 @@ class TestQwen3TTSGenerateICL(unittest.TestCase):
             ),
             patch.object(model, "_sample_token_batch", side_effect=sample_batch),
             patch.object(model, "_predict_code_tokens", side_effect=predict_codes),
+            patch(
+                "mlx_audio.tts.models.qwen3_tts.qwen3_tts.mx.clear_cache"
+            ) as mock_clear_cache,
         ):
             results = list(
                 model.batch_generate(
@@ -3296,6 +3400,7 @@ class TestQwen3TTSGenerateICL(unittest.TestCase):
         self.assertEqual(model.speech_tokenizer.decode.call_count, 2)
         decoded_codes = model.speech_tokenizer.decode.call_args_list[0][0][0]
         self.assertEqual(decoded_codes.shape[1], 6)  # ref_time(5) + generated(1)
+        mock_clear_cache.assert_called_once_with()
 
     def test_batch_generate_rejects_mixed_refs(self):
         """Qwen3 batch ICL currently accepts only one shared reference pair."""
@@ -3465,6 +3570,38 @@ class TestQwen3TTSStreamingDecode(unittest.TestCase):
 
         # streaming_interval=0.1 -> 1 token (minimum)
         self.assertEqual(max(1, int(0.1 * 12.5)), 1)
+
+    def test_non_streaming_generation_clears_cache_once_at_end(self):
+        """Standard generation clears the cache only after the final result."""
+        model = self._make_model()
+        hidden_size = model.config.talker_config.hidden_size
+        prepared_inputs = (
+            mx.zeros((1, 1, hidden_size)),
+            mx.zeros((1, 1, hidden_size)),
+            mx.zeros((1, 1, hidden_size)),
+        )
+
+        with (
+            patch.object(
+                model, "_prepare_generation_inputs", return_value=prepared_inputs
+            ),
+            patch.object(model, "_sample_token", return_value=mx.array([[5]])),
+            patch(
+                "mlx_audio.tts.models.qwen3_tts.qwen3_tts.mx.clear_cache"
+            ) as mock_clear_cache,
+        ):
+            results = list(
+                model.generate(
+                    text="Hello",
+                    max_tokens=51,
+                    stream=False,
+                    split_pattern="",
+                )
+            )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].token_count, 51)
+        mock_clear_cache.assert_called_once_with()
 
 
 @patch("importlib.resources.open_text", patched_open_text)
